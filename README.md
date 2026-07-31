@@ -22,9 +22,13 @@ systems use.
 - [x] Plain HTTP Host header extraction
 - [x] Rule-based blocking (by app, IP, or domain substring)
 - [x] Traffic report (per-app breakdown, forwarded/dropped counts)
-- [ ] Multi-threaded pipeline (load balancer + fast-path worker threads)
+- [x] Multi-threaded pipeline (dispatcher + worker pool, consistent hashing
+      on the five-tuple so each connection is always handled by the same
+      thread -- verified race-free with ThreadSanitizer)
+- [x] Live traffic interception on Windows via WinDivert (see `windivert_agent/`)
 - [ ] Node.js/Express API + MongoDB storage for historical stats
 - [ ] React dashboard for live traffic visualization
+- [ ] Windows Service packaging + multi-device fleet management
 
 ## Building
 
@@ -70,6 +74,26 @@ python3 generate_test_pcap.py
    without re-checking the rules.
 7. At the end, a report summarizes packet counts, per-app traffic
    percentages, and which domains/flows were blocked.
+
+## Multi-threaded version
+
+`src/main_mt.cpp` is a second entry point implementing the same pipeline
+with a dispatcher-thread + worker-pool architecture:
+
+```bash
+g++ -std=c++17 -O2 -pthread -I include -o dpi_engine_mt \
+    src/main_mt.cpp src/pcap_reader.cpp src/packet_parser.cpp src/sni_extractor.cpp src/types.cpp
+
+./dpi_engine_mt test_traffic.pcap --workers 4 --block-app YouTube
+```
+
+**Design:** each worker thread owns its own flow table (no shared
+`unordered_map` between threads). The dispatcher hashes each packet's
+five-tuple to consistently route it to the same worker every time, so a
+single connection's state is only ever touched by one thread -- no locks
+needed in the classification hot path. The only synchronization is a
+`ThreadSafeQueue` (mutex + condition variable) between the dispatcher and
+each worker. Verified data-race-free with `-fsanitize=thread`.
 
 ## Project structure
 
