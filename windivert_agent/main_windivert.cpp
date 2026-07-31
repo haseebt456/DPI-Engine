@@ -15,14 +15,16 @@
 // Run (MUST be Administrator):
 //   dpi_agent.exe --block-domain youtube.com --block-domain facebook.com
 
-#include <windivert.h>
-#include "sni_extractor.h"
+
 
 #include <iostream>
 #include <string>
 #include <unordered_set>
 #include <algorithm>
 #include <cstdint>
+#include "sni_extractor.h"
+#define WIN32_LEAN_AND_MEAN
+#include <windivert.h>
 
 namespace {
 
@@ -62,7 +64,7 @@ int main(int argc, char** argv) {
     // Only intercept outbound TCP traffic headed to port 443 (HTTPS).
     // Everything else passes through the kernel untouched -- we never see it,
     // so we never slow it down.
-    HANDLE handle = WinDivertOpen("outbound and tcp.DstPort == 443",
+    HANDLE handle = WinDivertOpen("outbound and (tcp.DstPort == 443 or udp.DstPort == 443)",
                                    WINDIVERT_LAYER_NETWORK, 0, 0);
     if (handle == INVALID_HANDLE_VALUE) {
         std::cerr << "Failed to open WinDivert handle (error " << GetLastError()
@@ -92,7 +94,17 @@ int main(int argc, char** argv) {
             uint8_t ihl = (packet[0] & 0x0F) * 4;
             uint8_t protocol = packet[9];
 
-            if (protocol == 6 && recv_len >= static_cast<UINT>(ihl) + 20) {
+            if(protocol == 17){
+                // QUIC (UDP:443) -- always drop. See the comment above
+                // WinDivertOpen() for why: we can't read the domain out of
+                // an encrypted QUIC handshake, so we close the bypass
+                // instead, forcing a fallback to TCP where we CAN inspect it.
+                char ip_buf[16];
+                snprintf(ip_buf, sizeof(ip_buf), "%u.%u.%u.%u",
+                         packet[16], packet[17], packet[18], packet[19]);
+                std::cout << "DROPPED UDP:443 (QUIC) -> " << ip_buf << "\n";
+                block = true;
+            }else if (protocol == 6 && recv_len >= static_cast<UINT>(ihl) + 20) {
                 const unsigned char* tcp = packet + ihl;
                 uint8_t data_offset = ((tcp[12] & 0xF0) >> 4) * 4;
                 size_t payload_offset = static_cast<size_t>(ihl) + data_offset;
