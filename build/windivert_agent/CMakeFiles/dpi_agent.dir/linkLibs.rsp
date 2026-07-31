@@ -1,0 +1,1 @@
+  -L"C:/WinDivert-2.2.2-A/x64"  -lWinDivert -lkernel32 -luser32 -lgdi32 -lwinspool -lshell32 -lole32 -loleaut32 -luuid -lcomdlg32 -ladvapi32 
