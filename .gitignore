@@ -1,0 +1,24 @@
+# Build artifacts
+dpi_engine
+*.o
+*.obj
+*.exe
+*.out
+build/
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+compile_commands.json
+Makefile
+
+# Generated captures and outputs
+output.pcap
+test_traffic.pcap
+
+# Python caches
+__pycache__/
+*.pyc
+
+# OS junk
+.DS_Store
+Thumbs.db
