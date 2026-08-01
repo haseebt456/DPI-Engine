@@ -79,7 +79,7 @@ int main(int argc, char** argv) {
     unsigned char packet[WINDIVERT_MTU_MAX];
     WINDIVERT_ADDRESS addr;
     UINT recv_len;
-
+    std::unordered_set<std::string> blocked_flows; // five-tuple key -> confirmed blocked
     while (true) {
         if (!WinDivertRecv(handle, packet, sizeof(packet), &recv_len, &addr)) {
             continue; // transient error, just keep going
@@ -104,21 +104,34 @@ int main(int argc, char** argv) {
                          packet[16], packet[17], packet[18], packet[19]);
                 std::cout << "DROPPED UDP:443 (QUIC) -> " << ip_buf << "\n";
                 block = true;
-            }else if (protocol == 6 && recv_len >= static_cast<UINT>(ihl) + 20) {
-                const unsigned char* tcp = packet + ihl;
-                uint8_t data_offset = ((tcp[12] & 0xF0) >> 4) * 4;
-                size_t payload_offset = static_cast<size_t>(ihl) + data_offset;
+            } else if (protocol == 6 && recv_len >= static_cast<UINT>(ihl) + 20) {
+                      const unsigned char* tcp = packet + ihl;
+                      uint16_t src_port = readU16BE(tcp);
+                      uint16_t dst_port = readU16BE(tcp + 2);
 
-                if (payload_offset < recv_len) {
-                    auto sni = SNIExtractor::extract(packet + payload_offset,
-                                                      recv_len - payload_offset);
-                    if (sni && rules.isBlocked(*sni)) {
-                        std::cout << "BLOCKED: " << *sni << "\n";
-                        block = true;
+                        char key_buf[64];
+                        snprintf(key_buf, sizeof(key_buf), "%u.%u.%u.%u-%u",
+                        packet[16], packet[17], packet[18], packet[19], dst_port + src_port * 65536u);
+                        std::string flow_key(key_buf);
+
+                         if (blocked_flows.count(flow_key)) {
+                            std::cout << "DROPPED (cached flow): " << flow_key << "\n";
+                            block = true; // already confirmed this connection is blocked -- drop every packet in it
+                         } else {
+                                 uint8_t data_offset = ((tcp[12] & 0xF0) >> 4) * 4;
+                                 size_t payload_offset = static_cast<size_t>(ihl) + data_offset;
+
+                                 if (payload_offset < recv_len) {
+                                 auto sni = SNIExtractor::extract(packet + payload_offset, recv_len - payload_offset);
+                                     if (sni && rules.isBlocked(*sni)) {
+                                        std::cout << "BLOCKED: " << *sni << "\n";
+                                        blocked_flows.insert(flow_key);
+                                        block = true;
+                                        }
+                                    }
+                                }
                     }
-                }
-            }
-        }
+}
 
         if (!block) {
             // Re-inject the packet unmodified so it continues on its way.
