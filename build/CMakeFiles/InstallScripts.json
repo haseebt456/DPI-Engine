@@ -1,8 +1,0 @@
-{
-	"InstallScripts" : 
-	[
-		"C:/Users/fastech laptop/Desktop/haseeb/New folder/Deep Packet Inspector/network analyzer/network_analyzer/build/cmake_install.cmake",
-		"C:/Users/fastech laptop/Desktop/haseeb/New folder/Deep Packet Inspector/network analyzer/network_analyzer/build/windivert_agent/cmake_install.cmake"
-	],
-	"Parallel" : false
-}
