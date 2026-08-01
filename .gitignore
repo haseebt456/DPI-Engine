@@ -1,1 +1,63 @@
-./build
+# Build artifacts
+/build/
+dpi_engine
+dpi_engine.exe
+dpi_engine_mt
+dpi_agent.exe
+*.o
+*.obj
+*.exe
+*.out
+*.dll
+*.sys
+*.pdb
+*.lib
+*.a
+*.lo
+
+# CMake and build system files
+/CMakeCache.txt
+/CMakeFiles/
+/compile_commands.json
+/Makefile
+cmake_install.cmake
+
+# Windivert runtime (copied next to dpi_agent during build)
+WinDivert.dll
+WinDivert64.sys
+windivert_agent/*.exe
+windivert_agent/*.dll
+windivert_agent/*.sys
+
+# Generated captures and outputs
+*.pcap
+output.pcap
+test_traffic.pcap
+out.pcap
+out_mt.pcap
+
+# Python caches and virtualenvs
+__pycache__/
+*.pyc
+env/
+venv/
+.venv/
+
+# Editor and OS files
+.vscode/
+.vs/
+.idea/
+.DS_Store
+Thumbs.db
+*.suo
+*.user
+
+# Logs and temp
+*.log
+tmp/
+temp/
+*.tmp
+
+# Misc
+*.bak
+*.swp
