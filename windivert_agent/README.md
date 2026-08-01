@@ -75,6 +75,31 @@ hook — nothing persists after the process exits).
 - No logging to file, no persistence between runs
 - Must be manually run as Administrator each time (this is exactly what
   the Windows Service step in the roadmap will fix)
+## Known limitation: HTTP/2 connection coalescing
+
+Testing against real-world traffic (YouTube specifically) surfaced a
+genuine architectural limit, not a bug:
+
+- **QUIC (UDP:443) bypass** -- fixed by dropping all outbound UDP:443,
+  forcing fallback to inspectable TLS-over-TCP.
+- **Multi-domain CDN footprints** -- YouTube's actual content is served
+  from `googlevideo.com`, `ytimg.com`, and `ggpht.com`, not just
+  `youtube.com`. Fixed by blocking the full domain family.
+- **No flow memory** -- a TLS connection only reveals its SNI once, in
+  the first packet. Fixed by caching classified five-tuples so every
+  later packet in a blocked connection is dropped too, not just the
+  handshake.
+- **HTTP/2 connection coalescing (unresolved)** -- browsers can reuse an
+  already-open TLS connection for a new hostname if it's covered by the
+  same certificate (common with large multi-domain providers like
+  Google). No new ClientHello is sent, so no SNI is ever exposed for
+  that hostname -- it rides along on a connection already classified as
+  allowed. This is invisible to any SNI-based filter, commercial or
+  otherwise. Defeating it requires either full TLS interception (a fake
+  root CA, decrypting traffic -- a fundamentally different and more
+  invasive architecture) or coarse IP/ASN-range blocking (blunt, and
+  breaks unrelated services sharing those IPs). Both are legitimate
+  future directions, but a different project from SNI inspection.
 
 ## Next steps (per the project roadmap)
 
