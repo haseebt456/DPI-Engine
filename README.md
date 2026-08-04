@@ -1,8 +1,9 @@
 # Network Traffic Analyzer (DPI Engine)
 
-A Deep Packet Inspection engine that reads `.pcap` captures, parses raw
-Ethernet/IPv4/TCP/UDP headers, classifies traffic by application using
-TLS SNI and HTTP Host extraction, and applies configurable blocking rules.
+A Deep Packet Inspection engine that classifies and blocks network traffic
+by application, using TLS SNI and HTTP Host extraction — without decrypting
+any traffic. Includes an offline `.pcap` analysis engine (single- and
+multi-threaded) and a live traffic-blocking agent for Windows.
 
 ## Why this project exists
 
@@ -24,35 +25,63 @@ systems use.
 - [x] Traffic report (per-app breakdown, forwarded/dropped counts)
 - [x] Multi-threaded pipeline (dispatcher + worker pool, consistent hashing
       on the five-tuple so each connection is always handled by the same
-      thread -- verified race-free with ThreadSanitizer)
+      thread — verified race-free with ThreadSanitizer)
 - [x] Live traffic interception on Windows via WinDivert (see `windivert_agent/`)
+- [x] CMake build covering all targets (Linux + Windows)
 - [ ] Node.js/Express API + MongoDB storage for historical stats
 - [ ] React dashboard for live traffic visualization
 - [ ] Windows Service packaging + multi-device fleet management
 
 ## Building
 
+### Offline engines (Linux/WSL or Windows via MSYS2)
+
 ```bash
-./build.sh
-# or manually:
-g++ -std=c++17 -O2 -I include -o dpi_engine \
-    src/main.cpp src/pcap_reader.cpp src/packet_parser.cpp src/sni_extractor.cpp src/types.cpp
+mkdir build && cd build
+cmake .. -G "MinGW Makefiles"   # omit -G on Linux
+cmake --build .
 ```
 
+This builds two targets:
+- `dpi_engine` — single-threaded, reads a `.pcap` file
+- `dpi_engine_mt` — multi-threaded version (dispatcher + worker pool)
+
+### Live Windows agent (WinDivert)
+
+Requires the WinDivert SDK (https://github.com/basil00/Divert/releases)
+extracted somewhere on disk. From the same `build/` directory:
+
+```bash
+cmake .. -G "MinGW Makefiles" -DWINDIVERT_ROOT="C:/WinDivert-2.2.2-A"
+cmake --build .
+```
+
+This additionally builds `dpi_agent.exe` in `build/windivert_agent/`, with
+`WinDivert.dll` / `WinDivert64.sys` copied alongside it automatically.
+
+Manual (non-CMake) build commands for each target are also documented
+inline in `build.sh` and `windivert_agent/README.md`.
+
 ## Running
+
+### Offline engine
 
 ```bash
 # Generate a sample capture (requires: pip install scapy)
 python3 generate_test_pcap.py
 
-# Run with no rules
-./dpi_engine test_traffic.pcap output.pcap
+# Single-threaded
+./dpi_engine test_traffic.pcap output.pcap --block-app YouTube --block-domain facebook
 
-# Run with blocking rules
-./dpi_engine test_traffic.pcap output.pcap \
-    --block-app YouTube \
-    --block-domain facebook \
-    --block-ip 192.168.1.50
+# Multi-threaded
+./dpi_engine_mt test_traffic.pcap --workers 4 --block-app YouTube
+```
+
+### Live agent (Windows, run as Administrator)
+
+```powershell
+cd build\windivert_agent
+.\dpi_agent.exe --block-domain youtube.com --block-domain googlevideo.com --block-domain ytimg.com --block-domain ggpht.com
 ```
 
 ## How it works
@@ -77,44 +106,91 @@ python3 generate_test_pcap.py
 
 ## Multi-threaded version
 
-`src/main_mt.cpp` is a second entry point implementing the same pipeline
-with a dispatcher-thread + worker-pool architecture:
+`src/main_mt.cpp` implements the same pipeline with a dispatcher-thread +
+worker-pool architecture. Each worker thread owns its own flow table (no
+shared `unordered_map` between threads). The dispatcher hashes each
+packet's five-tuple to consistently route it to the same worker every
+time, so a single connection's state is only ever touched by one thread —
+no locks needed in the classification hot path. The only synchronization
+is a `ThreadSafeQueue` (mutex + condition variable) between the dispatcher
+and each worker. Verified data-race-free with `-fsanitize=thread`.
 
-```bash
-g++ -std=c++17 -O2 -pthread -I include -o dpi_engine_mt \
-    src/main_mt.cpp src/pcap_reader.cpp src/packet_parser.cpp src/sni_extractor.cpp src/types.cpp
+## Live agent (WinDivert)
 
-./dpi_engine_mt test_traffic.pcap --workers 4 --block-app YouTube
-```
+`windivert_agent/main_windivert.cpp` reuses `SNIExtractor` unchanged and
+intercepts real outbound traffic on Windows via WinDivert:
 
-**Design:** each worker thread owns its own flow table (no shared
-`unordered_map` between threads). The dispatcher hashes each packet's
-five-tuple to consistently route it to the same worker every time, so a
-single connection's state is only ever touched by one thread -- no locks
-needed in the classification hot path. The only synchronization is a
-`ThreadSafeQueue` (mutex + condition variable) between the dispatcher and
-each worker. Verified data-race-free with `-fsanitize=thread`.
+- Intercepts outbound `tcp.DstPort == 443` (HTTPS) and `udp.DstPort == 443`
+  (QUIC/HTTP-3).
+- **QUIC is always dropped.** QUIC encrypts its handshake, so a domain
+  can't be read out of it the way TLS-over-TCP can; dropping it forces
+  browsers to fall back to inspectable TLS-over-TCP instead of silently
+  bypassing the filter.
+- TCP connections are classified via SNI extraction, same as the offline
+  engine. Once a five-tuple is confirmed blocked, it's cached — every
+  later packet in that connection is dropped too, since only the first
+  packet of a connection ever carries a readable SNI.
+
+See `windivert_agent/README.md` for full build/run instructions.
+
+### Known limitation: HTTP/2 connection coalescing
+
+Testing against real-world traffic (YouTube specifically) surfaced a
+genuine architectural limit, not a bug:
+
+- **QUIC (UDP:443) bypass** — fixed by dropping all outbound UDP:443,
+  forcing fallback to inspectable TLS-over-TCP.
+- **Multi-domain CDN footprints** — YouTube's actual content is served
+  from `googlevideo.com`, `ytimg.com`, and `ggpht.com`, not just
+  `youtube.com`. Fixed by blocking the full domain family.
+- **No flow memory** — a TLS connection only reveals its SNI once, in
+  the first packet. Fixed by caching classified five-tuples so every
+  later packet in a blocked connection is dropped too, not just the
+  handshake.
+- **HTTP/2 connection coalescing (unresolved)** — browsers can reuse an
+  already-open TLS connection for a new hostname if it's covered by the
+  same certificate (common with large multi-domain providers like
+  Google). No new ClientHello is sent, so no SNI is ever exposed for
+  that hostname — it rides along on a connection already classified as
+  allowed. This is invisible to any SNI-based filter, commercial or
+  otherwise. Defeating it requires either full TLS interception (a fake
+  root CA, decrypting traffic — a fundamentally different and more
+  invasive architecture) or coarse IP/ASN-range blocking (blunt, and
+  breaks unrelated services sharing those IPs). Both are legitimate
+  future directions, but a different project from SNI inspection.
 
 ## Project structure
 
 ```
-include/            Header files (declarations)
-  types.h            FiveTuple, Flow, AppType
-  pcap_reader.h       PCAP file format structs + reader
-  packet_parser.h    Ethernet/IPv4/TCP/UDP parsing
-  sni_extractor.h    TLS SNI + HTTP Host extraction
+include/                 Header files (declarations)
+  types.h                 FiveTuple, Flow, AppType
+  pcap_reader.h            PCAP file format structs + reader
+  packet_parser.h         Ethernet/IPv4/TCP/UDP parsing
+  sni_extractor.h         TLS SNI + HTTP Host extraction
+  thread_safe_queue.h     Mutex + condition-variable queue for the worker pool
 
-src/                 Implementations
-  main.cpp           Orchestrates the pipeline, applies rules, reports
+src/                      Offline engine implementations
+  pcap_reader.cpp
+  packet_parser.cpp
+  sni_extractor.cpp
+  types.cpp
+  main.cpp                Single-threaded entry point
+  main_mt.cpp             Multi-threaded entry point (dispatcher + workers)
 
-generate_test_pcap.py   Builds a sample capture for testing
-build.sh                Build script
+windivert_agent/          Live Windows traffic-blocking agent
+  main_windivert.cpp       WinDivert capture/verdict loop
+  sni_extractor.h/.cpp     Same SNI logic, reused unchanged
+  CMakeLists.txt
+  README.md                Full WinDivert setup/build/run instructions
+
+CMakeLists.txt            Top-level build (all targets)
+generate_test_pcap.py     Builds a sample capture for testing
+build.sh                  Manual (non-CMake) build script for the offline engines
 ```
 
 ## Roadmap
 
-This is the single-threaded core. Next: a multi-threaded pipeline
-(load-balancer + fast-path worker threads with consistent hashing so all
-packets of a flow land on the same thread), followed by a Node.js/Express
-API and MongoDB store so historical stats persist, and a React dashboard
-for live visualization.
+Remaining work: a Node.js/Express API + MongoDB store for historical
+stats, a React dashboard for live visualization, and Windows Service
+packaging so the agent runs on boot across multiple devices without
+manual admin launch.
