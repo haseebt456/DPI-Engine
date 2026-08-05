@@ -7,7 +7,7 @@ const request = require('supertest');
 // DB) -- the schema is dropped and recreated before the suite runs, so
 // every run starts from a clean slate.
 const TEST_DB_URL = process.env.TEST_DATABASE_URL
-  || 'postgresql://postgres:postgres@localhost:5432/dpi_dashboard_test';
+  || 'postgresql://postgres:haseeb@localhost:5432/dpi_dashboard_test';
 
 // IMPORTANT: this must happen before requiring '../src/app', because
 // src/db.js reads process.env.DATABASE_URL exactly once, at module-load
