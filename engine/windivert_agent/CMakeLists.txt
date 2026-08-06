@@ -17,8 +17,11 @@ endif()
 add_executable(dpi_agent
     main_windivert.cpp
     sni_extractor.cpp
+    http_client.cpp
+    config.cpp
+    json_mini.cpp
 )
-
+target_link_libraries(dpi_agent PRIVATE winhttp)
 target_include_directories(dpi_agent PRIVATE ${WINDIVERT_ROOT}/include)
 target_link_directories(dpi_agent PRIVATE ${WINDIVERT_ROOT}/x64)
 target_link_libraries(dpi_agent PRIVATE WinDivert)

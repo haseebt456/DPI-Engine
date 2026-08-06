@@ -1,28 +1,20 @@
-// DPI Agent - live version, Windows-only.
-//
-// Unlike the pcap-file version, this program intercepts REAL outbound
-// traffic from this machine using WinDivert, checks the destination domain
-// (via TLS SNI, reusing the same extractor from the offline engine), and
-// either lets the packet continue or silently drops it.
-//
-// Build (MSYS2 MinGW64 terminal, from this directory):
-//   g++ -std=c++17 -O2 -I <path-to-windivert>\include -o dpi_agent.exe ^
-//       main_windivert.cpp sni_extractor.cpp ^
-//       -L <path-to-windivert>\x64 -lWinDivert
-//
-// Then copy WinDivert.dll and WinDivert64.sys next to dpi_agent.exe.
-//
-// Run (MUST be Administrator):
-//   dpi_agent.exe --block-domain youtube.com --block-domain facebook.com
-
-
-
 #include <iostream>
 #include <string>
 #include <unordered_set>
 #include <algorithm>
 #include <cstdint>
+#include <thread>
+#include <mutex>
+#include <atomic>
+#include <chrono>
+#include <vector>
+#include <utility>
 #include "sni_extractor.h"
+#include "http_client.h"
+#include "config.h"
+#include "json_mini.h"
+#include "thread_safe_queue.h"
+
 #define WIN32_LEAN_AND_MEAN
 #include <windivert.h>
 
@@ -32,11 +24,8 @@ uint16_t readU16BE(const uint8_t* p) {
     return (static_cast<uint16_t>(p[0]) << 8) | p[1];
 }
 
-// Simple domain-substring block list. Same idea as the offline engine's
-// Rules struct, trimmed down to just what the live agent needs for now.
 struct Rules {
     std::unordered_set<std::string> blocked_domains;
-
     bool isBlocked(const std::string& sni) const {
         for (const auto& d : blocked_domains) {
             if (sni.find(d) != std::string::npos) return true;
@@ -45,102 +34,167 @@ struct Rules {
     }
 };
 
+std::mutex rules_mutex;
+Rules current_rules;
+std::atomic<bool> running{true};
+ThreadSafeQueue<std::pair<std::string, std::string>> event_queue; // domain, action
+
+bool doEnroll(const std::string& server_url, const std::string& pairing_code, const std::string& config_path) {
+    auto resp = HttpClient::post(server_url + "/api/devices/enroll", JsonMini::buildEnrollBody(pairing_code));
+    if (!resp.success) {
+        std::cerr << "Enrollment failed (HTTP " << resp.status_code << "): " << resp.body << "\n";
+        return false;
+    }
+
+    std::string device_id, api_key;
+    if (!JsonMini::extractStringField(resp.body, "apiKey", api_key)) {
+        std::cerr << "Enrollment response missing apiKey: " << resp.body << "\n";
+        return false;
+    }
+    // deviceId comes back as a number, not a string -- extract it manually.
+    size_t pos = resp.body.find("\"deviceId\"");
+    if (pos == std::string::npos) {
+        std::cerr << "Enrollment response missing deviceId: " << resp.body << "\n";
+        return false;
+    }
+    size_t colon = resp.body.find(':', pos);
+    size_t start = colon + 1;
+    size_t end = resp.body.find_first_of(",}", start);
+    device_id = resp.body.substr(start, end - start);
+    // trim whitespace
+    device_id.erase(0, device_id.find_first_not_of(" \t"));
+    device_id.erase(device_id.find_last_not_of(" \t") + 1);
+
+    AgentConfig cfg{server_url, device_id, api_key};
+    if (!ConfigStore::save(config_path, cfg)) {
+        std::cerr << "Failed to write config file: " << config_path << "\n";
+        return false;
+    }
+
+    std::cout << "Enrolled successfully. deviceId=" << device_id << "\n";
+    return true;
+}
+
+void rulePollLoop(const AgentConfig& cfg) {
+    while (running) {
+        auto resp = HttpClient::get(cfg.server_url + "/api/rules/for-device/" + cfg.device_id, cfg.api_key);
+        if (resp.success) {
+            auto entries = JsonMini::parseRulesArray(resp.body);
+            Rules updated;
+            for (const auto& e : entries) {
+                if (e.type == "domain") updated.blocked_domains.insert(e.value);
+            }
+            {
+                std::lock_guard<std::mutex> lock(rules_mutex);
+                current_rules = updated;
+            }
+            std::cout << "[poll] fetched " << entries.size() << " rule(s)\n";
+        } else {
+            std::cout << "[poll] failed (HTTP " << resp.status_code << ")\n";
+        }
+        std::this_thread::sleep_for(std::chrono::seconds(30));
+    }
+}
+
+void eventReportLoop(const AgentConfig& cfg) {
+    while (running) {
+        std::this_thread::sleep_for(std::chrono::seconds(10));
+
+        std::vector<std::pair<std::string, std::string>> batch;
+        while (batch.size() < 50) {
+            auto item = event_queue.try_pop();
+            if (!item) break;
+            batch.push_back(*item);
+        }
+        if (!batch.empty()) {
+            auto resp = HttpClient::post(cfg.server_url + "/api/events/" + cfg.device_id,
+                                          JsonMini::buildEventsBody(batch), cfg.api_key);
+            std::cout << "[report] sent " << batch.size() << " event(s), success=" << resp.success << "\n";
+        }
+    }
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
-    Rules rules;
-    for (int i = 1; i < argc; i++) {
-        std::string arg = argv[i];
-        if (arg == "--block-domain" && i + 1 < argc) {
-            rules.blocked_domains.insert(argv[++i]);
+    std::string config_path = "agent_config.txt";
+
+    // --- Enrollment mode: run once, then exit ---
+    if (argc >= 3 && std::string(argv[1]) == "--enroll") {
+        std::string pairing_code = argv[2];
+        std::string server_url = "http://localhost:4000";
+        for (int i = 3; i < argc; i++) {
+            if (std::string(argv[i]) == "--server" && i + 1 < argc) server_url = argv[++i];
         }
+        return doEnroll(server_url, pairing_code, config_path) ? 0 : 1;
     }
 
-    if (rules.blocked_domains.empty()) {
-        std::cerr << "Usage: " << argv[0] << " --block-domain <domain> [--block-domain <domain> ...]\n";
+    // --- Normal run mode ---
+    AgentConfig cfg;
+    if (!ConfigStore::load(config_path, cfg)) {
+        std::cerr << "No valid config found. Run enrollment first:\n"
+                  << "  " << argv[0] << " --enroll <pairingCode> --server http://<ip>:4000\n";
         return 1;
     }
 
-    // Only intercept outbound TCP traffic headed to port 443 (HTTPS).
-    // Everything else passes through the kernel untouched -- we never see it,
-    // so we never slow it down.
+    std::thread poll_thread(rulePollLoop, cfg);
+    std::thread report_thread(eventReportLoop, cfg);
+
     HANDLE handle = WinDivertOpen("outbound and (tcp.DstPort == 443 or udp.DstPort == 443)",
                                    WINDIVERT_LAYER_NETWORK, 0, 0);
     if (handle == INVALID_HANDLE_VALUE) {
         std::cerr << "Failed to open WinDivert handle (error " << GetLastError()
                   << "). Are you running as Administrator?\n";
+        running = false;
+        event_queue.shutdown();
+        poll_thread.join();
+        report_thread.join();
         return 1;
     }
 
-    std::cout << "DPI agent running. Blocking:";
-    for (const auto& d : rules.blocked_domains) std::cout << " " << d;
-    std::cout << "\nPress Ctrl+C to stop.\n";
+    std::cout << "DPI agent running (server-managed rules). Press Ctrl+C to stop.\n";
 
     unsigned char packet[WINDIVERT_MTU_MAX];
     WINDIVERT_ADDRESS addr;
     UINT recv_len;
-    std::unordered_set<std::string> blocked_flows; // five-tuple key -> confirmed blocked
-    while (true) {
-        if (!WinDivertRecv(handle, packet, sizeof(packet), &recv_len, &addr)) {
-            continue; // transient error, just keep going
-        }
+
+    while (running) {
+        if (!WinDivertRecv(handle, packet, sizeof(packet), &recv_len, &addr)) continue;
 
         bool block = false;
 
-        // At WINDIVERT_LAYER_NETWORK the buffer starts directly at the IPv4
-        // header -- there's no Ethernet header here (WinDivert already
-        // stripped that layer for us).
         if (recv_len >= 20) {
             uint8_t ihl = (packet[0] & 0x0F) * 4;
             uint8_t protocol = packet[9];
 
-            if(protocol == 17){
-                // QUIC (UDP:443) -- always drop. See the comment above
-                // WinDivertOpen() for why: we can't read the domain out of
-                // an encrypted QUIC handshake, so we close the bypass
-                // instead, forcing a fallback to TCP where we CAN inspect it.
-                char ip_buf[16];
-                snprintf(ip_buf, sizeof(ip_buf), "%u.%u.%u.%u",
-                         packet[16], packet[17], packet[18], packet[19]);
-                std::cout << "DROPPED UDP:443 (QUIC) -> " << ip_buf << "\n";
-                block = true;
+            if (protocol == 17) {
+                block = true; // QUIC -- always drop, forces TCP fallback
             } else if (protocol == 6 && recv_len >= static_cast<UINT>(ihl) + 20) {
-                      const unsigned char* tcp = packet + ihl;
-                      uint16_t src_port = readU16BE(tcp);
-                      uint16_t dst_port = readU16BE(tcp + 2);
+                const unsigned char* tcp = packet + ihl;
+                uint8_t data_offset = ((tcp[12] & 0xF0) >> 4) * 4;
+                size_t payload_offset = static_cast<size_t>(ihl) + data_offset;
 
-                        char key_buf[64];
-                        snprintf(key_buf, sizeof(key_buf), "%u.%u.%u.%u-%u",
-                        packet[16], packet[17], packet[18], packet[19], dst_port + src_port * 65536u);
-                        std::string flow_key(key_buf);
-
-                         if (blocked_flows.count(flow_key)) {
-                            std::cout << "DROPPED (cached flow): " << flow_key << "\n";
-                            block = true; // already confirmed this connection is blocked -- drop every packet in it
-                         } else {
-                                 uint8_t data_offset = ((tcp[12] & 0xF0) >> 4) * 4;
-                                 size_t payload_offset = static_cast<size_t>(ihl) + data_offset;
-
-                                 if (payload_offset < recv_len) {
-                                 auto sni = SNIExtractor::extract(packet + payload_offset, recv_len - payload_offset);
-                                     if (sni && rules.isBlocked(*sni)) {
-                                        std::cout << "BLOCKED: " << *sni << "\n";
-                                        blocked_flows.insert(flow_key);
-                                        block = true;
-                                        }
-                                    }
-                                }
+                if (payload_offset < recv_len) {
+                    auto sni = SNIExtractor::extract(packet + payload_offset, recv_len - payload_offset);
+                    if (sni) {
+                        std::lock_guard<std::mutex> lock(rules_mutex);
+                        if (current_rules.isBlocked(*sni)) {
+                            std::cout << "BLOCKED: " << *sni << "\n";
+                            event_queue.push({*sni, "blocked"});
+                            block = true;
+                        }
                     }
-}
-
-        if (!block) {
-            // Re-inject the packet unmodified so it continues on its way.
-            WinDivertSend(handle, packet, recv_len, nullptr, &addr);
+                }
+            }
         }
-        // If blocked, we simply don't call WinDivertSend -- the packet
-        // is dropped, and that connection attempt will time out.
+
+        if (!block) WinDivertSend(handle, packet, recv_len, nullptr, &addr);
     }
 
     WinDivertClose(handle);
+    running = false;
+    event_queue.shutdown();
+    poll_thread.join();
+    report_thread.join();
     return 0;
 }
