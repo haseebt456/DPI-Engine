@@ -44,6 +44,15 @@ public:
         cv_.notify_all();
     }
 
+    // Non-blocking: returns immediately whether or not an item was available.
+    std::optional<T> try_pop() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (queue_.empty()) return std::nullopt;
+    T item = std::move(queue_.front());
+    queue_.pop();
+    return item;
+}
+
 private:
     std::queue<T> queue_;
     std::mutex mutex_;
